@@ -4,7 +4,7 @@ import string
 import binascii
 
 
-from config import HA_TOKEN, HA_URL, CONFIG_PORT, LOG_LEVEL
+from config import HA_TOKEN, HA_URL, CONFIG_PORT, LOG_LEVEL, BRI_MAP
 
 IDLE_TIMEOUT = 0.250  # seconds of silence that we treat as “frame end”
 
@@ -40,6 +40,15 @@ def parse_command(line: str) -> Tuple[str, str, Optional[int]]:
 
     entity_id = parts[0].lower()
     action = parts[1].lower()
+
+    # Brightness mapping for PDEG numeric states (0..N)
+    if action.isdigit():
+        num = int(action)
+        if 0 <= num < len(BRI_MAP):
+            value = BRI_MAP[num]
+            action = "on" if value > 0 else "off"
+            brightness = round(value * 255 / 100)
+            return entity_id, action, brightness
 
     if action not in ("on", "off"):
         raise ValueError("Action must be ON or OFF")
