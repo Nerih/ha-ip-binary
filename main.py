@@ -6,6 +6,9 @@ import binascii
 
 from config import HA_TOKEN, HA_URL, CONFIG_PORT, LOG_LEVEL
 
+IDLE_TIMEOUT = 0.250  # seconds of silence that we treat as “frame end”
+
+
 # ───────────────────────────────────────────────
 # Logging
 # ───────────────────────────────────────────────
@@ -66,7 +69,6 @@ def parse_command(line: str) -> Tuple[str, str, Optional[int]]:
     return entity_id, action, brightness
 
 def bytes_hex(raw: bytes) -> str:
-    # "18 27 01 03 03 6C 69 67 68 74 ..."
     return " ".join(f"{b:02X}" for b in raw)
 
 def clean_command(raw: bytes) -> str:
@@ -88,6 +90,18 @@ def domain_from_entity(entity_id: str) -> str:
     if "." not in entity_id:
         raise ValueError("entity_id must include domain, e.g. 'light.shelly_bulb_1'")
     return entity_id.split(".", 1)[0]
+
+async def process_line(line: str):
+    try:
+        entity_id, action, brightness = parse_command(line)
+    except ValueError as ve:
+        logging.warning(f"Input error: {ve}; line={line!r}")
+        return
+    domain, service, payload = build_service_call(entity_id, action, brightness)
+    logging.info(f"HA call: {domain}.{service} {payload}")
+    # keep requests but avoid blocking the loop
+    await asyncio.to_thread(call_ha_service, domain, service, payload)
+    logging.info("OK")
 
 
 def build_service_call(entity_id: str, action: str, brightness: Optional[int]) -> Tuple[str, str, dict]:
@@ -131,35 +145,60 @@ def call_ha_service(domain: str, service: str, data: dict) -> None:
 # TCP handler
 # ───────────────────────────────────────────────
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    peer = None
+    peer = writer.get_extra_info("peername")
+    logging.info(f"Connected: {peer}")
+    buf = b""
     try:
-        peer = writer.get_extra_info("peername")
-        raw = await reader.readline()
-        line = clean_command(raw)
-        log.info(f"RX from {peer}: {line!r}")
+        while True:
+            try:
+                chunk = await asyncio.wait_for(reader.read(1024), timeout=IDLE_TIMEOUT)
+            except asyncio.TimeoutError:
+                # Idle: process whatever we have as a frame (if any)
+                if buf:
+                    logging.info(f"RAW (idle) {peer}: {bytes_hex(buf)}")
+                    line = clean_command(buf)
+                    logging.info(f"RX {peer}: {line!r}")
+                    if line:
+                        await process_line(line)
+                    else:
+                        logging.warning("Input error: no textual payload after stripping header")
+                    buf = b""
+                # keep connection open in case PDEG streams more later
+                continue
 
-        try:
-            entity_id, action, brightness = parse_command(line)
-        except ValueError as ve:
-            log.warning(f"Input error: {ve}; line={line!r}")
-            # input error: just drop the connection
-            return
+            if not chunk:
+                # EOF: process remaining buffer (if any), then exit
+                if buf:
+                    logging.info(f"RAW (eof)  {peer}: {bytes_hex(buf)}")
+                    line = clean_command(buf)
+                    logging.info(f"RX {peer}: {line!r}")
+                    if line:
+                        await process_line(line)
+                    else:
+                        logging.warning("Input error: no textual payload after stripping header")
+                break
 
-        try:
-            domain, service, payload = build_service_call(entity_id, action, brightness)
-            log.info(f"HA call: {domain}.{service} {payload}")
-        except ValueError as ve:
-            log.warning(f"build service error: {ve}; line={line!r}")
-            # input error: just drop the connection
-            return
-        
-        # Run blocking HTTP call without freezing the loop
-        await asyncio.to_thread(call_ha_service, domain, service, payload)
-        log.info("OK")
+            buf += chunk
+
+            # If PDEG *does* send CR/LF, split and process immediately
+            while True:
+                # split on first CR/LF if present
+                m = re.search(rb"[\r\n]", buf)
+                if not m:
+                    break
+                frame, buf = buf[:m.start()], buf[m.end():]
+                if not frame:
+                    continue
+                logging.info(f"RAW (crlf){peer}: {bytes_hex(frame)}")
+                line = clean_command(frame)
+                logging.info(f"RX {peer}: {line!r}")
+                if line:
+                    await process_line(line)
+                else:
+                    logging.warning("Input error: no textual payload after stripping header")
 
     except Exception:
-        # Any unexpected error -> log and exit to allow restart
-        log.exception("Fatal error in handler; exiting for supervisor restart")
+        logging.exception("Fatal error in handler; exiting for supervisor restart")
         os._exit(1)
     finally:
         try:
@@ -167,8 +206,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
             await writer.wait_closed()
         except Exception:
             pass
-
-
+        logging.info(f"Disconnected: {peer}")
 async def main():
     try:
         server = await asyncio.start_server(handle, "0.0.0.0", CONFIG_PORT)
